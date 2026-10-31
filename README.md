@@ -14,7 +14,9 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status: STM32H5 implemented** (branch `Dev/STM32H5`, controller and target role, POLL / ISR / DMA mode, unit tests on the 12 STM32H5
+> lines, integration tests compiled but not run on hardware). The other families are planned. The details and the deviations from the
+> interface below are in the section "STM32H5 implementation status".
 
 ---
 
@@ -89,7 +91,7 @@ master.
 
 | Family | Branch | Interface | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `I3C1`, `I3C2` (one instance on STM32H562 / H563 / H573, two on the others): the MIPI I3C v1.1 SDR primary / secondary controller and target, the legacy I2C messages Sm / Fm / Fm+, FIFOs with the DMA, the CCCs, IBI and the hot-join, up to 12.5 MHz | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `I3C1`, `I3C2` (one instance on STM32H562 / H563 / H573, two on the others): the MIPI I3C v1.1 SDR primary / secondary controller and target, the legacy I2C messages Sm / Fm / Fm+, FIFOs with the DMA, the CCCs, IBI and the hot-join, up to 12.5 MHz | implemented (`Dev/STM32H5`, hardware tests pending) |
 | STM32U5 | `Dev/STM32U5` | `I3C1` on the lines that have it | planned |
 | STM32U3 | `Dev/STM32U3` | device dependent | planned |
 | STM32H7 | `Dev/STM32H7` | I3C on the H7R / H7S lines only | planned |
@@ -97,6 +99,56 @@ master.
 
 A function without a meaning in a family stays in the interface, returns `I3C_REQUEST_ERROR` and suppresses the unused
 parameters (for example the target role on an instance without it, the DMA channel of a FIFO the instance does not have).
+
+### STM32H5 implementation status
+
+Branch `Dev/STM32H5`. Files: `I3c.c` (module management, bus timing, device table, bus bring-up), `I3c_Ctrl.c` (controller engine),
+`I3c_Xfer.c` (private and legacy messages, CCCs, in-band interrupt and hot-join), `I3c_Tgt.c` (target role), `I3c_Dma.c` (Gpdma channels of the
+data FIFOs), `I3c_Reg.c` (register access of the instances), `I3c_Pins.h` (SCL and SDA pin lists generated from the STM32CubeMX database).
+The unit tests run on the 12 STM32H5 lines (host, Unity + CMock + RegMem), the integration tests are compiled and linked, they were not run
+on hardware.
+
+| Item | STM32H5 |
+|---|---|
+| Instances | `I3C1`, `I3C2`; `I3C2` is missing on STM32H562 / H563 / H573 |
+| Kernel clock | PCLK1 / PLL3R (PLL2R on STM32H503) / HSI for `I3C1`, PCLK3 / PLL3R (PLL2R) / HSI for `I3C2`; at least twice the push-pull frequency |
+| Timing | durations rounded up to whole kernel clock cycles, the achieved frequencies (`I3c_Get_BusFreq`) are equal to or lower than the requested ones; the open-drain phase follows the slowest legacy I2C class of the device table |
+| Device table | four entries (the hardware has four target device registers, `I3C_DEVICE_CNT_MAX`); an I3C device needs a valid dynamic address to be addressed |
+| Static address of a target | only on `I3C1` of STM32H523 / H533 / H543 / H553 / H562 / H563 / H573 (register `I3C_I2CCFGR` at offset 0x98, not in the CMSIS type) |
+| Wake-up | `EXTI_LINE_I3C1_WKUP` / `EXTI_LINE_I3C2_WKUP` exist in the Exti module; the I3C wake-up from Stop mode is not used by this module |
+
+Deviations from the interface proposal (with the reason):
+
+- `i3c_TargetConfig_t` holds the 4-bit `InstanceId` instead of the PID: the provisioned ID of the STM32H5 target is fixed except for the
+  instance ID (RM0481 54.15.30).
+- The DMA mode serves the transmit and the receive FIFO (`TxDma*`, `RxDma*` in the configuration). The control and the status FIFO are served
+  by the CPU: a frame has two control words at most and the C-FIFO has two words. A read that the target ends early is reported with the bytes
+  received (`I3C_SR.XDCNT`), the DMA channel is stopped.
+- Transfer functions return at once in all modes; `I3c_Set_BusInit` and `I3c_Set_DynamicAddressAssign` wait for the end (bounded loop) because they
+  return the result.
+- `I3c_Set_DeviceTable` accepts the I3C devices with a dynamic address (and the PID that the assignment matches) and the legacy I2C devices with a
+  static address and a speed class. A SETDASA does not update the table, the application stores the assigned address with `I3c_Set_DeviceTable`.
+- The CCCs with a defining byte other than RSTACT are not offered (GETSTATUS format 2, GETCAPS format 2 ...); `ENTDAA` has its own function.
+- The hot-join acknowledge is global (`I3c_Set_HotJoinActive`), not per device; the in-band interrupt acceptance and its mandatory data byte are
+  per device (`I3c_Set_IbiConfig`, the device table).
+- The target has no event for the start of a read of the controller, the data has to be armed in advance (`I3c_Set_TargetReadBuffer`, preload). The
+  read request callback is called when a read finds no data. A write of the controller needs `I3c_Set_TargetWriteBuffer`, bytes beyond the buffer are dropped.
+- `I3c_Get_BusFreq` and `I3c_Get_OwnAddress` were added to the interface, `I3c_Set_HotJoinRequest` (target) as the counterpart of the hot-join
+  acknowledge of the controller.
+- The secondary controller role and the controller-role hand-off are not implemented (a controller-role request of a target is not acknowledged).
+
+Errata (the workarounds are applied by the module): the first frame with the address 0x7F after the enable of the controller (SDA pull-up until the line reads
+high, then the controller is initialized and enabled; ES0561 2.10.3, ES0621 2.13.3, ES0565 2.15.3, bug AB#2093; the workaround
+sequence is ES0561 2.11, ES0621 2.14, ES0565 2.16) and the SCL stalling in the
+address phase (the arbitrable header stays enabled, STALLA is never set, SCL stalling is not used; ES0561 2.10.2, ES0621 2.13.2, ES0565 2.15.2, bug AB#2092). No errata document was
+available for the STM32H5E4 / H5E5 / H5F4 / H5F5 lines, the same workarounds are applied.
+
+Other errata of the I3C controller (checked in ES0561 Rev 4, ES0621 Rev 2 and ES0565 Rev 7): "unexpected read data bytes during a legacy I2C
+read" (ES0561 2.10.1, ES0621 2.13.1, ES0565 2.15.1, bug AB#2091) is avoided because the module never sets STALLT in I3C_TIMINGR2;
+"no timestamp on IBI acknowledge when timing control is used in Asynchronous mode 0" (ES0561 2.10.4, ES0621 2.13.4, ES0565 2.15.4) is
+not applicable, the module offers no timing control (no SETXTIME CCC, no timestamp), so no bug exists for it. The ES0621 summary line
+"Deadlock or write-data corruption after spurious write to a misaligned address" (ES0621 2.4.5) belongs to the OCTOSPI (OCTOSPI_AR
+register) and does not concern the I3C module.
 
 ---
 
